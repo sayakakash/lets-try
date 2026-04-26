@@ -1,0 +1,1683 @@
+# ========== sqs_worker_app.py — HIGH CONCURRENCY GPU WORKER (Qwen Only) ==========
+# Runs inside the Docker container on each GPU EC2 instance.
+# Polls SQS, runs the FULL ML pipeline using vLLM for LLM inference.
+#
+# OPTIMIZATIONS:
+#   1. MAX_CONCURRENT_JOBS = 12 - Process up to 12 PDFs in parallel per worker
+#   2. Single Qwen instance for BOTH medications AND diagnoses
+#   3. Unified KV cache for better batching efficiency
+#   4. Dynamic backoff with 0.5s multiplier for high concurrency
+#   5. OCR lock to prevent memory spikes during concurrent OCR
+#   6. Pull ONLY 1 message at a time to prevent worker greediness
+#   7. Tensor memory error handling with retry mechanism
+#   8. DOUBLE-LOAD FIX: Removed duplicate Qwen from worker process (saves 5.5GB)
+#   9. All existing features preserved (DynamoDB locks, EFS, etc.)
+#   10. FULL OCR TEXT LOGGING - Complete page text in job logs (no truncation)
+#
+# FIX v3 CHANGES:
+#   11. ALL classified sub-doc types included in extraction (facesheet, other,
+#       home_health_order, order_summary, f2f) — no pages skipped
+#   12. Tilted-page OCR fix: lines re-sorted by Y-coordinate before assembly
+#   13. ORDER_SUMMARY: LLM extraction no longer skipped when regex insufficient
+#   14. smart_extract_text now tries rotation-corrected fitz extraction for
+#       tilted pages before falling back to PaddleOCR
+# =====================================================================
+
+import os
+import uuid
+import gc
+import json
+import time
+import glob
+import threading
+import logging
+import concurrent.futures
+from threading import Lock
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+import numpy as np
+import torch
+import requests
+import boto3
+from flask import Flask, jsonify, request
+from PyPDF2 import PdfReader, PdfWriter
+from pdf2image import convert_from_path
+from openai import OpenAI
+from botocore.exceptions import ClientError
+
+# ── 1. PERMANENT PATH CONFIGURATION ──────────────────────────────────────────
+BASE_DIR = "/opt/ml/code"
+
+LOG_BASE_DIR     = os.environ.get("LOG_BASE_PATH",    "/opt/ml/code/logs")
+RESULT_BASE_DIR  = os.environ.get("RESULT_BASE_PATH", "/opt/ml/code/results")
+UPLOAD_FOLDER    = os.environ.get("UPLOAD_BASE_PATH", "/opt/ml/code/uploads")
+EXTRACT_OUTPUT_DIR = "/opt/ml/code/f2foutput"
+IMAGES_FOLDER    = "/opt/ml/code/images"
+CLASSIFIED_PDF_BASE = "/opt/ml/code/classified_pdfs"
+MODEL_BASE_PATH  = os.environ.get("MODEL_BASE_PATH", "/mnt/models")
+JOB_LOGS_DIR     = os.path.join(LOG_BASE_DIR, "jobs")
+ICD_DATA_PATH    = os.path.join(MODEL_BASE_PATH, "icd_codes.json")
+
+for _d in [LOG_BASE_DIR, RESULT_BASE_DIR, UPLOAD_FOLDER, EXTRACT_OUTPUT_DIR,
+           IMAGES_FOLDER, CLASSIFIED_PDF_BASE, JOB_LOGS_DIR]:
+    os.makedirs(_d, exist_ok=True)
+
+# ── 2. INSTANCE ID ────────────────────────────────────────────────────────────
+def _get_instance_id() -> str:
+    try:
+        with open("/etc/instance-id/instance-id", "r") as f:
+            val = f.read().strip()
+            if val and val != "unknown":
+                return val
+    except Exception:
+        pass
+    try:
+        with open("/etc/instance-id", "r") as f:
+            val = f.read().strip()
+            if val and val != "unknown":
+                return val
+    except Exception:
+        pass
+    try:
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            timeout=2
+        ).text
+        return requests.get(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token},
+            timeout=2
+        ).text.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+INSTANCE_ID = _get_instance_id()
+WORKER_ID   = f"worker_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
+LOG_FILE    = os.path.join(LOG_BASE_DIR, f"{WORKER_ID}.log")
+
+# ── 3. ENV CONFIG ─────────────────────────────────────────────────────────────
+SQS_QUEUE_URL              = os.environ.get("SQS_QUEUE_URL", "")
+SQS_VISIBILITY_TIMEOUT     = int(os.environ.get("SQS_VISIBILITY_TIMEOUT", "600"))
+SQS_WAIT_TIME              = int(os.environ.get("SQS_WAIT_TIME_SECONDS", "20"))
+USE_S3                     = os.environ.get("USE_S3", "true").lower() == "true"
+S3_BUCKET                  = os.environ.get("S3_BUCKET", "monaddatabase")
+S3_PREFIX                  = os.environ.get("S3_PREFIX", "")
+AWS_REGION                 = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+ASG_NAME                   = os.environ.get("ASG_NAME", "monad-gpu-workers")
+DISPATCHER_URL             = os.environ.get("DISPATCHER_URL", "http://172.31.25.192:5001")
+
+WARM_POOL_SIZE             = int(os.environ.get("WARM_POOL_SIZE", "3"))
+WARM_IDLE_LOG_MINUTES      = int(os.environ.get("WARM_IDLE_LOG_MINUTES", "10"))
+TERMINATE_AFTER_COMPLETION_SECONDS = int(os.environ.get("TERMINATE_AFTER_COMPLETION_SECONDS", "600"))
+
+# HIGH CONCURRENCY: Both URLs point to the SAME Qwen instance on port 8000
+VLLM_LLAMA_URL   = os.environ.get("VLLM_LLAMA_URL", "http://localhost:8000/v1")
+VLLM_QWEN_URL    = os.environ.get("VLLM_QWEN_URL", "http://localhost:8000/v1")
+VLLM_READY_TIMEOUT = int(os.environ.get("VLLM_READY_TIMEOUT_SECONDS", "600"))
+
+# ── CONCURRENT PROCESSING CONFIG ──────────────────────────────────────────────
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "12"))
+_ocr_lock = Lock()
+_ocr_retry_count = 3
+
+# Doc types that contain extractable medication/diagnosis content
+# ALL types are now included so no pages are skipped
+EXTRACTION_DOC_TYPES_PRIORITY = [
+    "order_summary",   # highest priority — structured pharmacy orders
+    "f2f",             # face-to-face clinical notes
+    "facesheet",       # patient facesheet often has diagnosis table
+    "other",           # may contain diagnosis information sheets
+    "home_health_order", # home health order may list medications
+]
+
+if not SQS_QUEUE_URL:
+    print("❌ FATAL: SQS_QUEUE_URL not set.")
+    raise SystemExit(1)
+
+# ── 4. IMPORTS ────────────────────────────────────────────────────────────────
+from helpers.downloadpdf import download_file
+from helpers.load_model import load_models, load_risk_models
+from scripts.classify_documents import classify_pdf
+from scripts.main import upload_status as _upload_status
+from scripts.risk_predict import risk_prediction
+from scripts.icd_medications import extract_all
+from scripts.extract_demographics import extract_demographics
+from scripts.poc import poc
+from helpers.transform_output import transform_raw_output, merge_extracted_data
+
+import paddle
+from paddleocr import PaddleOCR
+
+# ── 4b. JOB LOGGER (per-UUID structured log) ──────────────────────────────────
+from job_logger import JobLogger
+
+# ── 5. AWS CLIENTS ────────────────────────────────────────────────────────────
+s3_client = None
+sqs_client = None
+asg_client = None
+
+# ── 6. GLOBAL WORKER STATE ────────────────────────────────────────────────────
+_shutdown_flag    = threading.Event()
+_status_lock      = threading.Lock()
+_gpu_lock         = threading.Semaphore(1)
+processing_status: Dict[str, Any] = {}
+_job_completed_at = 0.0
+_job_completed_lock = threading.Lock()
+_jobs_processed   = 0
+_INSTANCE_INDEX   = None
+_IS_SURGE_WORKER  = None
+
+
+# ============================================================
+# DYNAMODB DISTRIBUTED LOCK (True Atomic Locks)
+# ============================================================
+
+dynamodb_client = boto3.client('dynamodb', region_name=AWS_REGION)
+LOCK_TABLE_NAME = 'monad-job-locks'
+
+def acquire_job_lock(file_uuid: str, ttl_seconds: int = 3600) -> bool:
+    try:
+        dynamodb_client.put_item(
+            TableName=LOCK_TABLE_NAME,
+            Item={
+                'job_id': {'S': file_uuid},
+                'worker_id': {'S': WORKER_ID},
+                'instance_id': {'S': INSTANCE_ID},
+                'acquired_at': {'N': str(int(time.time()))},
+                'ttl': {'N': str(int(time.time() + ttl_seconds))}
+            },
+            ConditionExpression='attribute_not_exists(job_id) OR #t < :now',
+            ExpressionAttributeNames={'#t': 'ttl'},
+            ExpressionAttributeValues={':now': {'N': str(int(time.time()))}}
+        )
+        logger.info(f"🔒 Acquired lock for {file_uuid}")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            try:
+                response = dynamodb_client.get_item(
+                    TableName=LOCK_TABLE_NAME,
+                    Key={'job_id': {'S': file_uuid}}
+                )
+                if 'Item' in response:
+                    holder = response['Item'].get('worker_id', {}).get('S', 'unknown')
+                    logger.warning(f"⚠️ Job {file_uuid} already locked by worker: {holder}")
+                else:
+                    logger.warning(f"⚠️ Job {file_uuid} already locked by another worker")
+            except Exception:
+                logger.warning(f"⚠️ Job {file_uuid} already locked by another worker")
+            return False
+        logger.error(f"Lock error: {e}")
+        return False
+
+def release_job_lock(file_uuid: str):
+    try:
+        dynamodb_client.delete_item(
+            TableName=LOCK_TABLE_NAME,
+            Key={'job_id': {'S': file_uuid}}
+        )
+        logger.info(f"🔓 Released lock for {file_uuid}")
+    except Exception as e:
+        logger.warning(f"Failed to release lock: {e}")
+
+def is_job_already_processed(file_uuid: str) -> bool:
+    result_path = os.path.join(RESULT_BASE_DIR, f"{file_uuid}.json")
+    if os.path.exists(result_path):
+        logger.info(f"📁 Job {file_uuid} already has result file - skipping duplicate")
+        return True
+    
+    with _status_lock:
+        if file_uuid in processing_status:
+            status = processing_status[file_uuid].get("status_overall")
+            if status in ["completed", "completed_with_errors"]:
+                logger.info(f"📊 Job {file_uuid} already marked as {status} - skipping duplicate")
+                return True
+    return False
+
+
+# ============================================================
+# PROGRESS HELPERS
+# ============================================================
+
+def _get_progress_percent(state: dict) -> int:
+    status = state.get("status", "")
+    if "Classification" in status:
+        return 20
+    elif "POC" in status and state.get("status_poc") == "processing":
+        return 40
+    elif "Demographics" in status:
+        return 60
+    elif "ICD" in status or "Medications" in status:
+        return 80
+    elif status in ["completed", "completed_with_errors"]:
+        return 100
+    elif status == "failed":
+        return 100
+    return 10
+
+def _get_processing_stage(state: dict) -> str:
+    status = state.get("status", "")
+    if "Classification" in status:
+        return "Classification"
+    elif "POC" in status:
+        return "POC Processing"
+    elif "Demographics" in status:
+        return "Demographics"
+    elif "ICD" in status or "Medications" in status:
+        return "ICD & Medications"
+    elif status in ["completed", "completed_with_errors"]:
+        return "Completed"
+    return "Processing"
+
+def format_time_remaining(seconds: int) -> str:
+    if seconds <= 0:
+        return "Completed"
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+    minutes = seconds // 60
+    secs = seconds % 60
+    if minutes >= 60:
+        hours = minutes // 60
+        mins = minutes % 60
+        if mins == 0:
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        return f"{hours} hour{'s' if hours != 1 else ''} {mins} minute{'s' if mins != 1 else ''}"
+    if secs == 0:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{minutes} minute{'s' if minutes != 1 else ''} {secs} second{'s' if secs != 1 else ''}"
+
+def upload_status(file_uuid: str, status_dict: dict, message: str):
+    with _status_lock:
+        if file_uuid not in status_dict:
+            status_dict[file_uuid] = {
+                "status": "initializing",
+                "status_overall": "pending",
+                "documents": [],
+            }
+    _upload_status(file_uuid, status_dict, message)
+
+
+# ============================================================
+# GPU MEMORY HELPERS
+# ============================================================
+
+def _clear_gpu_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        paddle.device.cuda.empty_cache()
+    except Exception:
+        pass
+
+def _log_gpu_memory(tag: str = "") -> float:
+    if not torch.cuda.is_available():
+        return 99.0
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserv = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    free = total - reserv
+    label = f" [{tag}]" if tag else ""
+    logger.info(f"[GPU-MEM]{label} alloc={alloc:.2f}GiB reserved={reserv:.2f}GiB free={free:.2f}GiB / {total:.1f}GiB")
+    return free
+
+
+# ============================================================
+# vLLM READINESS CHECK
+# ============================================================
+
+def wait_for_vllm(timeout: int = VLLM_READY_TIMEOUT) -> bool:
+    start = time.time()
+    qwen_ready = False
+
+    logger.info(f"⏳ Waiting for vLLM Qwen endpoint (timeout: {timeout}s)...")
+    logger.info(f"   Qwen: {VLLM_QWEN_URL}/models")
+
+    while time.time() - start < timeout:
+        elapsed = int(time.time() - start)
+
+        if not qwen_ready:
+            try:
+                resp = requests.get(f"{VLLM_QWEN_URL}/models", timeout=(3, 5))
+                if resp.status_code == 200:
+                    logger.info(f"✅ vLLM Qwen ready after {elapsed}s")
+                    qwen_ready = True
+            except Exception:
+                pass
+
+        if qwen_ready:
+            logger.info(f"🎉 vLLM Qwen endpoint ready after {elapsed}s")
+            return True
+
+        if elapsed % 30 == 0 and elapsed > 0:
+            logger.info(f"⏳ Still waiting... Qwen={'✅' if qwen_ready else '⏳'} ({elapsed}s)")
+        time.sleep(5)
+
+    logger.error(f"❌ vLLM Qwen endpoint not ready within {timeout}s")
+    return False
+
+
+# ============================================================
+# TERMINATION
+# ============================================================
+
+def _notify_dispatcher_complete(file_uuid: str, success: bool):
+    if not DISPATCHER_URL:
+        return
+    try:
+        requests.post(
+            f"{DISPATCHER_URL}/job_complete",
+            json={"id": file_uuid, "success": success, "instance_id": INSTANCE_ID, "worker_id": WORKER_ID},
+            timeout=5,
+        )
+        logger.info(f"📤 Notified dispatcher: {file_uuid} complete (success={success})")
+    except Exception as e:
+        logger.warning(f"Could not notify dispatcher for {file_uuid}: {e}")
+
+def _schedule_termination(delay_seconds: int):
+    def _timer():
+        logger.info(f"⏲️  Surge worker terminating in {delay_seconds}s...")
+        time.sleep(delay_seconds)
+        logger.info("⏰ Termination timer fired")
+        terminate_self()
+    threading.Thread(target=_timer, daemon=True, name="TerminationTimer").start()
+
+def terminate_self():
+    _shutdown_flag.set()
+    logger.info(f"🛑 Self-termination: instance {INSTANCE_ID}")
+    try:
+        asg_client.terminate_instance_in_auto_scaling_group(
+            InstanceId=INSTANCE_ID,
+            ShouldDecrementDesiredCapacity=True
+        )
+        logger.info(f"✅ Termination request sent for {INSTANCE_ID}")
+    except Exception as e:
+        logger.error(f"Termination via ASG failed: {e} — using hard exit")
+        raise SystemExit(0)
+
+
+# ============================================================
+# OCR / TEXT EXTRACTION - WITH FULL TEXT LOGGING TO JOB LOGS
+# FIX v3: Y-sorted line reconstruction for tilted pages
+# ============================================================
+
+def _reconstruct_ocr_lines_by_reading_order(result) -> str:
+    """
+    Re-sort PaddleOCR result lines by (Y, X) reading order.
+    
+    PaddleOCR on tilted/scanned pages can return lines sorted by X-coordinate
+    (left column vs right column) rather than top-to-bottom reading order.
+    This function bins lines into Y-rows (with a tolerance), then sorts by Y then X.
+    
+    This produces text that reads naturally top-to-bottom, left-to-right,
+    which is critical for medication section detection.
+    
+    For the ##X:NNN## coordinate-tagged format we preserve the tags so that
+    icd_medications.py ORDER_SUMMARY X-coordinate date lookup still works.
+    """
+    if not result or not result[0]:
+        return ""
+    
+    lines = []
+    for line in result[0]:
+        if line and line[1] and line[1][0]:
+            bbox = line[0]
+            y_top = int(min(pt[1] for pt in bbox))
+            y_bot = int(max(pt[1] for pt in bbox))
+            x_left = int(min(pt[0] for pt in bbox))
+            lines.append((y_top, y_bot, x_left, line[1][0]))
+    
+    if not lines:
+        return ""
+    
+    # Sort by Y then X — this gives reading-order for non-tilted pages
+    lines.sort(key=lambda t: (t[0], t[2]))
+    
+    # Build the ##X:NNN## tagged output (preserving coordinate metadata)
+    parts = []
+    for y_top, y_bot, x_left, txt in lines:
+        parts.append(f"##X:{x_left}## {txt}\n")
+    
+    return "".join(parts)
+
+
+def _print_ocr_page_text(page_idx, total_pages, page_text, file_uuid, doc_type="OCR", jlog=None):
+    """Print OCR text preview AND full text to job logs (no truncation)"""
+    preview = page_text.strip()[:500] if page_text else ""
+    total_len = len(page_text.strip())
+    
+    print(f"\n{'─'*70}", flush=True)
+    print(f"[{doc_type}-TEXT] UUID={file_uuid}  Page {page_idx+1}/{total_pages}  (Total: {total_len:,} chars)", flush=True)
+    print(f"{'─'*70}", flush=True)
+    print(f"PREVIEW: {preview}", flush=True)
+    if total_len > 500:
+        print(f"... [{total_len-500} more chars]", flush=True)
+    print(f"{'─'*70}", flush=True)
+    
+    print(f"\n[{doc_type}-FULL-START] UUID={file_uuid} Page {page_idx+1}/{total_pages}", flush=True)
+    print(page_text, flush=True)
+    print(f"[{doc_type}-FULL-END] UUID={file_uuid} Page {page_idx+1}/{total_pages}", flush=True)
+    
+    if jlog:
+        jlog.info(f"[{doc_type}-FULL-TEXT] Page {page_idx+1}/{total_pages}:\n{page_text}")
+
+def _safe_ocr_call(img_array, retry_count=3):
+    for attempt in range(retry_count):
+        try:
+            with _ocr_lock:
+                result = ocr.ocr(img_array, cls=True)
+            return result
+        except Exception as e:
+            error_msg = str(e)
+            if "Tensor holds no memory" in error_msg:
+                logger.warning(f"⚠️ Tensor memory error in OCR (attempt {attempt + 1}/{retry_count})")
+                time.sleep(0.5 * (attempt + 1))
+                _clear_gpu_memory()
+                continue
+            raise e
+    logger.error(f"❌ OCR failed after {retry_count} attempts")
+    return None
+
+def _ocr_extract_text(pdf_path: str, file_uuid: str = "", jlog=None) -> str:
+    try:
+        total_pages = len(PdfReader(pdf_path).pages)
+    except Exception:
+        return ""
+    t0 = time.time()
+    print(f"\n{'='*70}", flush=True)
+    print(f"[OCR] Starting OCR extraction for {file_uuid} - {total_pages} pages", flush=True)
+    print(f"{'='*70}", flush=True)
+    
+    if jlog:
+        jlog.info(f"[OCR] Starting OCR extraction for {file_uuid} - {total_pages} pages")
+    
+    try:
+        all_images = convert_from_path(pdf_path, dpi=200, thread_count=4, fmt="jpeg", jpegopt={"quality": 85, "optimize": True})
+        print(f"[OCR] Rasterized {len(all_images)} pages in {time.time()-t0:.1f}s", flush=True)
+        if jlog:
+            jlog.info(f"[OCR] Rasterized {len(all_images)} pages in {time.time()-t0:.1f}s")
+    except Exception as e:
+        logger.warning(f"convert_from_path failed: {e}")
+        if jlog:
+            jlog.warn(f"convert_from_path failed: {e}")
+        return ""
+    
+    text_parts = []
+    for page_idx, img in enumerate(all_images):
+        w, h = img.size
+        arr = np.array(img)
+        
+        print(f"[OCR] Processing page {page_idx+1}/{total_pages} ({w}x{h})", flush=True)
+        if jlog:
+            jlog.info(f"[OCR] Processing page {page_idx+1}/{total_pages} ({w}x{h})")
+        
+        result = _safe_ocr_call(arr, _ocr_retry_count)
+        if result is None:
+            print(f"[OCR] Page {page_idx+1}/{total_pages}: OCR FAILED", flush=True)
+            if jlog:
+                jlog.warn(f"[OCR] Page {page_idx+1}/{total_pages}: OCR FAILED")
+            continue
+        
+        # FIX v3: Use reading-order reconstruction (Y-sorted) instead of raw result
+        page_text = _reconstruct_ocr_lines_by_reading_order(result)
+        
+        line_count = page_text.count('\n')
+        text_parts.append(page_text)
+        
+        print(f"[OCR] Page {page_idx+1}/{total_pages}: {line_count} lines ({w}x{h}) - {len(page_text):,} chars", flush=True)
+        _print_ocr_page_text(page_idx, total_pages, page_text, file_uuid, doc_type="OCR", jlog=jlog)
+    
+    del all_images
+    _clear_gpu_memory()
+    full_text = "".join(text_parts)
+    elapsed = time.time() - t0
+    print(f"\n[OCR] COMPLETE: {len(full_text):,} chars extracted in {elapsed:.1f}s", flush=True)
+    logger.info(f"[OCR] {len(full_text)} chars in {elapsed:.1f}s")
+    if jlog:
+        jlog.info(f"[OCR] COMPLETE: {len(full_text):,} chars extracted in {elapsed:.1f}s")
+    return full_text
+
+def _native_text_quality_score(text: str, total_pages: int) -> float:
+    """
+    Score the quality of native PDF text extraction.
+    Returns a score from 0 (garbage) to 100+ (good quality).
+    """
+    if not text or total_pages == 0:
+        return 0.0
+
+    avg_chars_per_page = len(text.strip()) / total_pages
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return 0.0
+
+    single_char_lines = sum(1 for ln in lines if len(ln) == 1)
+    single_char_ratio = single_char_lines / len(lines)
+
+    clinical_kw = [
+        'tablet', 'capsule', 'mg', 'mcg', 'diagnosis', 'patient',
+        'admission', 'pharmacy', 'physician', 'medication', 'allerg',
+        'daily', 'birth', 'insurance', 'name', 'address', 'date',
+    ]
+    text_lower = text.lower()
+    kw_hits = sum(1 for kw in clinical_kw if kw in text_lower)
+
+    score = avg_chars_per_page * (1.0 - single_char_ratio) + kw_hits * 5
+    return score
+
+
+def smart_extract_text(pdf_path: str, file_uuid: str = "", jlog=None) -> str:
+    """
+    FIX v3: Try native text extraction first with quality gate.
+    If quality is poor (tilted/scanned PDF), fall back to PaddleOCR.
+    Native text uses fitz which handles clean PDFs well.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        sample_text = "".join(doc[i].get_text() for i in range(min(2, total_pages)))
+
+        if len(sample_text.strip()) > 150:
+            QUALITY_THRESHOLD = 30.0
+
+            logger.info("🚀 Native PDF text detected — extracting native text")
+            print(f"\n{'='*70}", flush=True)
+            print(f"[NATIVE] Starting native text extraction for {file_uuid} - {total_pages} pages", flush=True)
+            print(f"{'='*70}", flush=True)
+
+            if jlog:
+                jlog.info(f"[NATIVE] Starting native text extraction for {file_uuid} - {total_pages} pages")
+
+            text_parts = []
+            for page_idx, page in enumerate(doc):
+                page_text = page.get_text() + "\n"
+                text_parts.append(page_text)
+                print(f"[NATIVE] Page {page_idx+1}/{total_pages}: {len(page_text):,} chars", flush=True)
+                _print_ocr_page_text(page_idx, total_pages, page_text, file_uuid, doc_type="NATIVE", jlog=jlog)
+
+            doc.close()
+            full_text = "".join(text_parts)
+            quality = _native_text_quality_score(full_text, total_pages)
+
+            print(f"\n[NATIVE] COMPLETE: {len(full_text):,} chars extracted  quality_score={quality:.1f}", flush=True)
+            if jlog:
+                jlog.info(f"[NATIVE] COMPLETE: {len(full_text):,} chars extracted  quality_score={quality:.1f}")
+
+            if quality >= QUALITY_THRESHOLD:
+                return full_text
+
+            print(f"[NATIVE] ⚠️  Quality score {quality:.1f} < {QUALITY_THRESHOLD} — "
+                  f"native text is likely garbage, falling back to OCR", flush=True)
+            if jlog:
+                jlog.warn(f"[NATIVE] Quality score {quality:.1f} < {QUALITY_THRESHOLD} — "
+                          f"falling back to OCR for {file_uuid}")
+        else:
+            doc.close()
+
+    except Exception as e:
+        logger.warning(f"Native text extraction failed: {e}")
+        if jlog:
+            jlog.warn(f"Native text extraction failed: {e}")
+
+    return _ocr_extract_text(pdf_path, file_uuid, jlog=jlog)
+
+
+# ============================================================
+# PDF HELPERS
+# ============================================================
+
+def _extract_pages_to_pdf(src_pdf_path: str, page_indices: list, out_path: str) -> str:
+    """Extract specific pages (0-indexed) from a PDF into a new file."""
+    reader = PdfReader(src_pdf_path)
+    writer = PdfWriter()
+    for idx in page_indices:
+        if 0 <= idx < len(reader.pages):
+            writer.add_page(reader.pages[idx])
+    with open(out_path, "wb") as f:
+        writer.write(f)
+    return out_path
+
+def split_facesheet_and_f2f(pdf_path, file_uuid):
+    reader = PdfReader(pdf_path)
+    fs_w = PdfWriter()
+    fs_w.add_page(reader.pages[0])
+    facesheet_path = os.path.join(RESULT_BASE_DIR, f"facesheet_{file_uuid}.pdf")
+    with open(facesheet_path, "wb") as f:
+        fs_w.write(f)
+    f2f_w = PdfWriter()
+    for i in range(1, len(reader.pages)):
+        f2f_w.add_page(reader.pages[i])
+    f2f_path = os.path.join(RESULT_BASE_DIR, f"f2f_{file_uuid}.pdf")
+    with open(f2f_path, "wb") as f:
+        f2f_w.write(f)
+    return facesheet_path, f2f_path
+
+def convert_poc_pdf_to_images(pdf_path, file_uuid):
+    try:
+        images = convert_from_path(pdf_path, dpi=200, thread_count=4)
+        paths = []
+        for i, img in enumerate(images, start=1):
+            path = os.path.join(IMAGES_FOLDER, f"{file_uuid}_poc_page_{i}.png")
+            img.save(path, "PNG")
+            paths.append(path)
+        del images
+        _clear_gpu_memory()
+        return paths
+    except Exception as e:
+        logger.error(f"POC image conversion failed: {e}")
+        return []
+
+def cleanup_poc_images(file_uuid):
+    for p in glob.glob(os.path.join(IMAGES_FOLDER, f"{file_uuid}_poc_page_*.png")):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+def calculate_initial_total_time(total_pages, has_poc=False, has_facesheet=False, has_order_summary=False, is_native_pdf=False):
+    base_time = 1
+    per_page = 0.3 if is_native_pdf else 1
+    demo_time = 20 if has_facesheet else 0
+    icd_time = 50 if has_order_summary else 67
+    poc_time = 40 if has_poc else 0
+    return int(base_time + (total_pages * per_page) + demo_time + icd_time + poc_time)
+
+def load_f2f_extraction_result(uuid_str: str) -> dict:
+    path = os.path.join(EXTRACT_OUTPUT_DIR, f"{uuid_str}_f2f.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def s3_key(*parts):
+    parts = [p.strip("/").replace("\\", "/") for p in parts if p]
+    key = "/".join(parts)
+    return f"{S3_PREFIX.strip('/')}/{key}" if S3_PREFIX else key
+
+def upload_file_to_s3(local_path, bucket, key):
+    if USE_S3 and s3_client:
+        try:
+            s3_client.upload_file(local_path, bucket, key)
+            return f"https://{bucket}.s3.amazonaws.com/{key}"
+        except Exception:
+            return None
+    return f"file://{os.path.abspath(local_path)}"
+
+
+# ============================================================
+# VLLM WRAPPER FUNCTIONS FOR extract_all
+# ============================================================
+
+def llm_complete_llama_wrapper(prompt: str, **kwargs) -> str:
+    try:
+        response = qwen_client.chat.completions.create(
+            model=LLM_QWEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=kwargs.get("temperature", 0.1),
+            max_tokens=kwargs.get("max_tokens", kwargs.get("max_new_tokens", 2048)),
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Qwen vLLM call failed: {e}")
+        return ""
+
+def llm_complete_qwen_wrapper(prompt: str, **kwargs) -> str:
+    try:
+        response = qwen_client.chat.completions.create(
+            model=LLM_QWEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=kwargs.get("temperature", 0.1),
+            max_tokens=kwargs.get("max_tokens", kwargs.get("max_new_tokens", 2048)),
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Qwen vLLM call failed: {e}")
+        return ""
+
+def _make_logged_llm_wrappers(jlog: JobLogger):
+    _llama_call_idx = [0]
+    _qwen_call_idx  = [0]
+
+    def logged_llama(prompt: str, **kwargs) -> str:
+        _llama_call_idx[0] += 1
+        t0 = time.time()
+        result = llm_complete_llama_wrapper(prompt, **kwargs)
+        elapsed = time.time() - t0
+        jlog.llm_io(
+            model_name=f"Qwen[{LLM_QWEN_MODEL.split('/')[-1]}]",
+            prompt=prompt,
+            response=result,
+            elapsed_s=elapsed,
+            extra={
+                "call_index": _llama_call_idx[0],
+                "max_tokens": kwargs.get("max_tokens", kwargs.get("max_new_tokens", 2048)),
+                "temperature": kwargs.get("temperature", 0.1),
+            },
+        )
+        return result
+
+    def logged_qwen(prompt: str, **kwargs) -> str:
+        _qwen_call_idx[0] += 1
+        t0 = time.time()
+        result = llm_complete_qwen_wrapper(prompt, **kwargs)
+        elapsed = time.time() - t0
+        jlog.llm_io(
+            model_name=f"Qwen[{LLM_QWEN_MODEL.split('/')[-1]}]",
+            prompt=prompt,
+            response=result,
+            elapsed_s=elapsed,
+            extra={
+                "call_index": _qwen_call_idx[0],
+                "max_tokens": kwargs.get("max_tokens", kwargs.get("max_new_tokens", 2048)),
+                "temperature": kwargs.get("temperature", 0.1),
+            },
+        )
+        return result
+
+    return logged_llama, logged_qwen
+
+
+def _extract_demographics_vllm(
+    file_uuid: str,
+    facesheet_path: str,
+    original_s3_url: Optional[str],
+    jlog: JobLogger,
+) -> dict:
+    jlog.info(f"[Demographics] facesheet_path={facesheet_path}")
+    jlog.info(f"[Demographics] original_s3_url={original_s3_url}")
+
+    try:
+        t0 = time.time()
+        _, logged_qwen_fn = _make_logged_llm_wrappers(jlog)
+        result = extract_demographics(
+            pdf_id=file_uuid,
+            pdf_path=facesheet_path,
+            llm_complete_fn=logged_qwen_fn,
+            generate_kwargs={"max_new_tokens": 2048, "temperature": 0.1},
+            original_s3_url=original_s3_url,
+        )
+        elapsed = time.time() - t0
+        jlog.info(f"[Demographics] Approach 1 succeeded in {elapsed:.1f}s")
+        jlog.demographics_result(result or {}, elapsed)
+        return result or {}
+    except TypeError as te:
+        jlog.warn(f"[Demographics] Approach 1 not supported ({te})")
+    except Exception as e:
+        jlog.error(f"[Demographics] Approach 1 failed: {e}", e)
+
+    try:
+        jlog.info("[Demographics] Approach 3: direct vLLM text extraction")
+        t0 = time.time()
+
+        facesheet_text = smart_extract_text(facesheet_path, file_uuid=file_uuid + "_fs", jlog=jlog)
+        jlog.info(f"[Demographics] facesheet text length: {len(facesheet_text)} chars")
+
+        demo_prompt = f"""Extract patient demographics from this medical facesheet.
+Return ONLY valid JSON with keys: first_name, last_name, middle_name, dob, gender, ssn,
+primary_care_physician_name, primary_care_physician_npi, expected_discharge_date,
+facility_name, insurances (list), contacts (list), patient_home_address (dict).
+
+FACESHEET TEXT:
+{facesheet_text[:6000]}
+
+JSON output only:"""
+
+        t_llm = time.time()
+        raw = llm_complete_qwen_wrapper(demo_prompt, max_new_tokens=2048, temperature=0.1)
+        llm_elapsed = time.time() - t_llm
+
+        jlog.llm_io(
+            model_name=f"Qwen-vLLM[demographics-fallback]",
+            prompt=demo_prompt,
+            response=raw,
+            elapsed_s=llm_elapsed,
+        )
+
+        import re
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+        else:
+            result = {}
+
+        elapsed = time.time() - t0
+        jlog.info(f"[Demographics] Approach 3 succeeded in {elapsed:.1f}s")
+        jlog.demographics_result(result, elapsed)
+        return result
+
+    except Exception as e3:
+        jlog.error(f"[Demographics] All approaches failed. Last error: {e3}", e3)
+        return {}
+
+
+# ============================================================
+# FULL ML PIPELINE — JobLogger edition
+# FIX v3: All classified doc types now included in extraction
+# ============================================================
+
+def _run_pipeline(job_data: dict) -> bool:
+    file_uuid = job_data.get("id")
+    if not file_uuid:
+        logger.error("Job missing 'id' field — skipping")
+        return False
+
+    if is_job_already_processed(file_uuid):
+        logger.info(f"⏭️ Skipping already processed job: {file_uuid}")
+        return True
+
+    start_time = time.time()
+
+    jlog = JobLogger(
+        file_uuid=file_uuid,
+        log_dir=JOB_LOGS_DIR,
+        instance_id=INSTANCE_ID,
+        worker_id=WORKER_ID,
+    )
+
+    logged_llama, logged_qwen = _make_logged_llm_wrappers(jlog)
+
+    logger.info(f"▶️  Pipeline start: {file_uuid}  log={jlog.log_path}")
+    jlog.info(f"Pipeline started on instance {INSTANCE_ID} (index={_INSTANCE_INDEX}, surge={_IS_SURGE_WORKER})")
+    jlog.info(f"vLLM Qwen: {VLLM_QWEN_URL}  model={LLM_QWEN_MODEL}")
+    jlog.gpu("PIPELINE-START")
+
+    try:
+        callback_url = job_data.get("callback_url") or job_data.get("callback_endpoint") or ""
+        documents = job_data.get("documents", [])
+
+        with _status_lock:
+            processing_status[file_uuid] = {
+                "status": "AI process initiated",
+                "documents": [],
+                "callback_url": callback_url,
+                "callback_endpoint": callback_url,
+                "status_icd_med": "pending",
+                "status_facesheet": "pending",
+                "status_f2f": "pending",
+                "status_poc": "pending",
+                "status_overall": "pending",
+                "start_time": start_time,
+                "has_order_summary": False,
+                "created_at": datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S"),
+                "instance_id": INSTANCE_ID,
+                "worker_id": WORKER_ID,
+                "instance_index": _INSTANCE_INDEX,
+                "is_surge_worker": _IS_SURGE_WORKER,
+            }
+
+        # ── STEP: Download PDF ─────────────────────────────────────────────
+        with jlog.step("download"):
+            main_doc_url = next((d["doc_url"] for d in documents if d.get("doc_url")), None)
+            if not main_doc_url:
+                raise ValueError("No 'doc_url' found in job payload.")
+
+            jlog.info(f"Downloading from: {main_doc_url}")
+            save_path = os.path.join(UPLOAD_FOLDER, f"{file_uuid}.pdf")
+            download_file(main_doc_url, save_path)
+
+            try:
+                original_page_count = len(PdfReader(save_path).pages)
+            except Exception:
+                original_page_count = 0
+
+            jlog.info(f"Downloaded OK — {original_page_count} pages  path={save_path}")
+            jlog.set_step_result("download", {"pages": original_page_count, "url": main_doc_url})
+
+            with _status_lock:
+                processing_status[file_uuid]["documents"].append({
+                    "doc_name": f"{file_uuid}.pdf",
+                    "doc_url": main_doc_url,
+                    "doc_type": "original",
+                    "page_count": original_page_count,
+                    "original_pages": list(range(1, original_page_count + 1)),
+                })
+
+            estimated_pages = original_page_count or 10
+            initial_total = calculate_initial_total_time(
+                total_pages=estimated_pages, has_poc=True, has_facesheet=True
+            )
+            with _status_lock:
+                processing_status[file_uuid]["total_estimated_time"] = initial_total
+                processing_status[file_uuid]["total_estimated_time_set_at"] = start_time
+
+        # ── STEP: Classification (WITH OCR LOCK) ───────────────────────────────
+        with jlog.step("classify"):
+            _clear_gpu_memory()
+            jlog.gpu("PRE-CLASSIFY")
+
+            with _status_lock:
+                processing_status[file_uuid]["status"] = "Classification"
+            upload_status(file_uuid, processing_status, "Classification started")
+
+            t_classif = time.time()
+            
+            with _ocr_lock:
+                facesheet_count, f2f_count, poc_count, medications_count, doc_meta, all_preds = classify_pdf(
+                    save_path, file_uuid, processing_status, llmv3_processor, llmv3_model, ocr_instance=ocr
+                )
+            
+            classif_elapsed = time.time() - t_classif
+
+            jlog.gpu("POST-CLASSIFY")
+
+            with _status_lock:
+                processing_status[file_uuid]["documents"].extend(doc_meta)
+                processing_status[file_uuid]["facesheet"]    = facesheet_count > 0
+                processing_status[file_uuid]["f2f"]          = f2f_count > 0
+                processing_status[file_uuid]["poc"]          = poc_count > 0
+                processing_status[file_uuid]["medications"]  = medications_count > 0
+                has_order_summary = any(d.get("doc_type") == "order_summary" for d in doc_meta)
+                processing_status[file_uuid]["has_order_summary"] = has_order_summary
+
+            _facesheet_pages = [d.get("original_pages", []) for d in doc_meta if d.get("doc_type") == "facesheet"]
+            _f2f_pages       = [d.get("original_pages", []) for d in doc_meta if d.get("doc_type") == "f2f"]
+            _poc_pages       = [d.get("original_pages", []) for d in doc_meta if d.get("doc_type") == "poc"]
+            _other_pages     = [d.get("original_pages", []) for d in doc_meta
+                                if d.get("doc_type") not in ("facesheet", "f2f", "poc")]
+
+            jlog.classification_result(
+                total_pages=original_page_count,
+                facesheet_pages=sum(_facesheet_pages, []),
+                f2f_pages=sum(_f2f_pages, []),
+                poc_pages=sum(_poc_pages, []),
+                other_pages=sum(_other_pages, []),
+                elapsed_s=classif_elapsed,
+            )
+            jlog.kv("facesheet_count", facesheet_count)
+            jlog.kv("f2f_count",       f2f_count)
+            jlog.kv("poc_count",       poc_count)
+            jlog.kv("doc_meta_types",  [d.get("doc_type") for d in doc_meta])
+            jlog.set_step_result("classify", {
+                "facesheet": facesheet_count, "f2f": f2f_count, "poc": poc_count
+            })
+
+            elapsed = time.time() - start_time
+            remaining = max(5, initial_total - elapsed)
+            with _status_lock:
+                processing_status[file_uuid]["total_estimated_time"] = remaining
+                processing_status[file_uuid]["total_estimated_time_set_at"] = time.time()
+                processing_status[file_uuid]["status"] = "Classification completed"
+
+            upload_status(file_uuid, processing_status, "Classification completed")
+            _clear_gpu_memory()
+
+        # ── STEP: POC ─────────────────────────────────────────────────────
+        if processing_status[file_uuid].get("poc"):
+            with jlog.step("poc"):
+                try:
+                    with _status_lock:
+                        processing_status[file_uuid].update({"status": "POC processing", "status_poc": "processing"})
+                    upload_status(file_uuid, processing_status, "POC processing started")
+                    jlog.gpu("PRE-POC")
+
+                    poc_pdf_path = None
+                    for doc in doc_meta:
+                        if doc.get("doc_type") == "poc":
+                            poc_pdf_path = os.path.join(CLASSIFIED_PDF_BASE, file_uuid, doc["doc_name"])
+                            break
+
+                    jlog.info(f"POC pdf path: {poc_pdf_path}")
+                    if poc_pdf_path and os.path.exists(poc_pdf_path):
+                        convert_poc_pdf_to_images(poc_pdf_path, file_uuid)
+                    
+                    result = poc(file_uuid, None, None, processing_status)
+                    jlog.gpu("POST-POC")
+                    jlog.info(f"POC result keys: {list((result or {}).keys())}")
+                    jlog.set_step_result("poc", {"keys": list((result or {}).keys())})
+
+                    with _status_lock:
+                        processing_status[file_uuid].update({
+                            "poc_result": result or {},
+                            "status_poc": "completed",
+                            "status": "POC completed",
+                        })
+                    upload_status(file_uuid, processing_status, "POC processed successfully")
+                except Exception as poc_err:
+                    jlog.error(f"POC failed: {poc_err}", poc_err)
+                    with _status_lock:
+                        processing_status[file_uuid].update({
+                            "status_poc": "failed",
+                            "poc_error": str(poc_err),
+                            "poc_result": {},
+                        })
+                finally:
+                    _clear_gpu_memory()
+        else:
+            jlog.info("POC step SKIPPED — no POC pages detected")
+            with _status_lock:
+                processing_status[file_uuid]["status_poc"] = "skipped"
+
+        # ── STEP: Demographics ────────────────────────────────────────────
+        run_demo = bool(processing_status[file_uuid].get("facesheet"))
+        run_icd  = bool(processing_status[file_uuid].get("f2f") or processing_status[file_uuid].get("facesheet"))
+
+        jlog.info(f"run_demographics={run_demo}  run_icd={run_icd}")
+
+        if run_demo:
+            with jlog.step("demographics"):
+                with _status_lock:
+                    processing_status[file_uuid]["status_facesheet"] = "processing"
+
+                upload_status(file_uuid, processing_status, "Demographics extraction started")
+
+                facesheet_path = None
+                for doc in doc_meta:
+                    if doc.get("doc_type") == "facesheet":
+                        candidate = os.path.join(CLASSIFIED_PDF_BASE, file_uuid, doc["doc_name"])
+                        if os.path.exists(candidate):
+                            facesheet_path = candidate
+                            break
+
+                if not facesheet_path:
+                    facesheet_pages = sum(
+                        [d.get("original_pages", []) for d in doc_meta if d.get("doc_type") == "facesheet"], []
+                    )
+                    if facesheet_pages:
+                        facesheet_path = _extract_pages_to_pdf(
+                            save_path, [p - 1 for p in facesheet_pages],
+                            os.path.join(RESULT_BASE_DIR, f"facesheet_{file_uuid}.pdf")
+                        )
+                    else:
+                        facesheet_path, _ = split_facesheet_and_f2f(save_path, file_uuid)
+
+                original_doc = next(
+                    (d for d in processing_status[file_uuid]["documents"] if d["doc_type"] == "original"),
+                    None
+                )
+                jlog.info(f"facesheet_path: {facesheet_path}")
+                jlog.info(f"facesheet exists: {os.path.exists(facesheet_path)}")
+                _clear_gpu_memory()
+                jlog.gpu("PRE-DEMOGRAPHICS")
+
+                demographics_result = _extract_demographics_vllm(
+                    file_uuid=file_uuid,
+                    facesheet_path=facesheet_path,
+                    original_s3_url=original_doc["doc_url"] if original_doc else None,
+                    jlog=jlog,
+                )
+
+                jlog.gpu("POST-DEMOGRAPHICS")
+                _clear_gpu_memory()
+
+                with _status_lock:
+                    processing_status[file_uuid].update({
+                        "demographics_result": demographics_result or {},
+                        "facesheet_result": {"demographics": demographics_result or {}},
+                        "status_facesheet": "completed",
+                        "status": "Demographics completed",
+                    })
+                upload_status(file_uuid, processing_status, "Demographics extraction completed")
+                jlog.set_step_result("demographics", {
+                    "name": f"{demographics_result.get('first_name','')} {demographics_result.get('last_name','')}".strip(),
+                    "dob": demographics_result.get("dob", ""),
+                    "fields_found": len([v for v in demographics_result.values() if v]),
+                })
+        else:
+            jlog.warn("Demographics SKIPPED — no facesheet detected")
+            with _status_lock:
+                processing_status[file_uuid]["status_facesheet"] = "skipped"
+                processing_status[file_uuid]["demographics_result"] = {}
+
+        # ── STEP: ICD / Medications ───────────────────────────────────────
+        # FIX v3: Always run ICD/Meds if we have ANY classified document.
+        # Include ALL doc types: order_summary, f2f, facesheet, other, home_health_order.
+        # This ensures no pages are silently dropped.
+        run_icd = bool(doc_meta)  # run if we have any classified docs at all
+
+        if run_icd:
+            with jlog.step("icd_medications"):
+                with _status_lock:
+                    processing_status[file_uuid].update({
+                        "status_icd_med": "processing",
+                        "status_f2f": "processing",
+                        "status": "ICD & Medications processing",
+                    })
+                upload_status(file_uuid, processing_status, "ICD & Medications extraction started")
+
+                jlog.gpu("PRE-OCR-TEXT")
+
+                # ── FIX v3: Collect text from ALL doc types in priority order ──────
+                # order_summary and f2f first (richest data), then facesheet,
+                # then other and home_health_order (may contain additional info)
+                text_parts = []
+                extraction_pdf_path = save_path  # fallback
+
+                # Track which types we've already added (avoid double-extracting)
+                extracted_types = set()
+
+                for priority_type in EXTRACTION_DOC_TYPES_PRIORITY:
+                    for doc in doc_meta:
+                        doc_type = doc.get("doc_type", "")
+                        if doc_type != priority_type:
+                            continue
+                        if doc_type in extracted_types:
+                            continue  # already added a doc of this type
+
+                        candidate = os.path.join(CLASSIFIED_PDF_BASE, file_uuid, doc.get("doc_name", ""))
+                        if not os.path.exists(candidate):
+                            jlog.warn(f"Classified PDF not found: {candidate}")
+                            continue
+
+                        jlog.info(f"Extracting text from {doc_type}: {candidate}")
+                        doc_text = smart_extract_text(candidate, file_uuid=f"{file_uuid}_{doc_type}", jlog=jlog)
+
+                        if doc_text.strip():
+                            section_label = doc_type.upper().replace("_", " ")
+                            text_parts.append(f"=== {section_label} ===\n{doc_text}")
+                            jlog.info(f"[{doc_type}] extracted {len(doc_text):,} chars")
+                            extracted_types.add(doc_type)
+
+                            # Use order_summary as primary PDF for type detection
+                            if doc_type == "order_summary" and extraction_pdf_path == save_path:
+                                extraction_pdf_path = candidate
+                        else:
+                            jlog.warn(f"[{doc_type}] extraction returned empty text")
+
+                if not text_parts:
+                    jlog.warn("No classified sub-documents produced text — falling back to full PDF OCR")
+                    ocr_text = smart_extract_text(save_path, file_uuid=file_uuid, jlog=jlog)
+                else:
+                    ocr_text = "\n\n".join(text_parts)
+
+                jlog.info(f"Combined extraction text: {len(ocr_text):,} chars from {len(text_parts)} sub-doc(s)")
+                jlog.info(f"Doc types included: {list(extracted_types)}")
+                jlog.info(f"OCR text preview (first 500 chars): {ocr_text[:500]}")
+
+                jlog.gpu("POST-OCR-TEXT")
+                _clear_gpu_memory()
+
+                jlog.info("Calling extract_all with logged vLLM wrappers...")
+                jlog.gpu("PRE-EXTRACT-ALL")
+
+                extract_all(
+                    id=file_uuid,
+                    text=ocr_text,
+                    llm_complete_llama=logged_llama,
+                    llm_complete_qwen=logged_qwen,
+                    icd_data_path=ICD_DATA_PATH,
+                    pdf_path=extraction_pdf_path,
+                    gpu_lock=_gpu_lock,
+                )
+                jlog.gpu("POST-EXTRACT-ALL")
+                _clear_gpu_memory()
+
+                result = load_f2f_extraction_result(file_uuid)
+                diags   = result.get("diagnosis",   []) if result else []
+                meds    = result.get("medications",  []) if result else []
+                allergs = result.get("allergies",    []) if result else []
+
+                jlog.extraction_result(
+                    diagnoses=diags,
+                    medications=meds,
+                    allergies=allergs,
+                    elapsed_s=jlog._step_durations.get("icd_medications", 0),
+                )
+                jlog.set_step_result("icd_medications", {
+                    "diagnoses": len(diags),
+                    "medications": len(meds),
+                    "allergies": len(allergs),
+                })
+
+                with _status_lock:
+                    if result:
+                        processing_status[file_uuid].update({
+                            "f2f_result":         result,
+                            "icd_medications":    result,
+                            "icd_result":         diags,
+                            "medications_result": meds,
+                            "allergies_result":   allergs,
+                        })
+                    else:
+                        processing_status[file_uuid]["icd_medications"] = {}
+                        jlog.warn("extract_all produced NO result file")
+                    processing_status[file_uuid].update({
+                        "status_icd_med": "completed",
+                        "status_f2f":     "completed",
+                    })
+
+                upload_status(file_uuid, processing_status, "ICD & Medications extraction completed")
+                jlog.info(f"💊 ICD & Medications done — {len(diags)} dx, {len(meds)} meds, {len(allergs)} allergies")
+                time.sleep(1)
+        else:
+            jlog.warn("ICD/Medications SKIPPED — no classified documents found")
+            with _status_lock:
+                processing_status[file_uuid].update({"status_icd_med": "skipped", "icd_medications": {}})
+
+        # ── STEP: Finalize ────────────────────────────────────────────────
+        with jlog.step("finalize"):
+            failed_steps = [
+                k.replace("status_", "").replace("_", " ").title()
+                for k in ["status_icd_med", "status_facesheet", "status_f2f", "status_poc"]
+                if processing_status[file_uuid].get(k) == "failed"
+            ]
+            jlog.info(f"Failed steps: {failed_steps if failed_steps else 'none'}")
+
+            with _status_lock:
+                processing_status[file_uuid].update({
+                    "status_overall": "completed_with_errors" if failed_steps else "completed",
+                    "status": "completed",
+                })
+
+            merged_state  = merge_extracted_data(processing_status[file_uuid])
+            final_details = transform_raw_output(merged_state)
+
+            out_path = os.path.join(RESULT_BASE_DIR, f"{file_uuid}.json")
+            with open(out_path, "w") as f:
+                json.dump(final_details, f, indent=4)
+            jlog.info(f"Result written to: {out_path}")
+
+            final_message = (
+                f"Completed with errors: {', '.join(failed_steps)}"
+                if failed_steps else "All extraction completed successfully"
+            )
+            upload_status(file_uuid, processing_status, final_message)
+            jlog.set_step_result("finalize", {
+                "status": "completed_with_errors" if failed_steps else "completed",
+                "result_path": out_path,
+            })
+
+        total_elapsed = time.time() - start_time
+        jlog.info(f"✅ Pipeline done in {total_elapsed:.1f}s")
+        jlog.gpu("PIPELINE-END")
+        logger.info(f"✅ {file_uuid} done in {total_elapsed:.1f}s")
+
+        with _job_completed_lock:
+            global _job_completed_at, _jobs_processed
+            _job_completed_at = time.time()
+            _jobs_processed += 1
+
+        _notify_dispatcher_complete(file_uuid, success=True)
+        jlog.info(f"🏁 Job complete. {'Surge worker — terminating' if _IS_SURGE_WORKER else 'Warm worker — staying alive'}")
+        jlog.finish(success=True, total_s=total_elapsed)
+        return True
+
+    except Exception as e:
+        total_elapsed = time.time() - start_time
+        jlog.error(f"💥 Critical pipeline failure: {e}", e)
+        logger.exception(f"💥 Critical pipeline failure for {file_uuid}: {e}")
+        with _status_lock:
+            processing_status.setdefault(file_uuid, {}).update({
+                "status": "failed",
+                "status_overall": "failed",
+                "critical_error": str(e),
+            })
+        upload_status(file_uuid, processing_status, f"Critical failure: {str(e)[:150]}")
+        _clear_gpu_memory()
+        _notify_dispatcher_complete(file_uuid, success=False)
+        jlog.finish(success=False, total_s=total_elapsed)
+        return False
+
+    finally:
+        release_job_lock(file_uuid)
+        cleanup_poc_images(file_uuid)
+        _clear_gpu_memory()
+        elapsed = time.time() - start_time
+        logger.info(f"⏱️  {file_uuid} total time: {elapsed:.1f}s")
+
+
+# ============================================================
+# SQS POLLER WITH DYNAMIC BACKOFF
+# ============================================================
+
+def _process_single_message(msg):
+    try:
+        receipt_handle = msg['ReceiptHandle']
+        body = msg.get('Body', '{}')
+        job_data = json.loads(body)
+        job_id = job_data.get("id", "unknown")
+
+        if not acquire_job_lock(job_id):
+            logger.warning(f"⚠️ Job {job_id} already locked - deleting duplicate")
+            sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+            return
+
+        if is_job_already_processed(job_id):
+            logger.warning(f"⚠️ Job {job_id} already has result - skipping")
+            release_job_lock(job_id)
+            sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+            return
+
+        logger.info(f"📥 JOB RECEIVED: {job_id} (worker_type={'SURGE' if _IS_SURGE_WORKER else 'WARM'})")
+
+        success = _run_pipeline(job_data)
+
+        if success:
+            sqs_client.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+            logger.info(f"🗑️ SQS message deleted for {job_id}")
+        else:
+            logger.warning(f"⚠️ Job {job_id} failed. Message will re-appear in SQS.")
+            release_job_lock(job_id)
+
+        if not _IS_SURGE_WORKER:
+            logger.info(f"🔄 Warm worker continuing. Total jobs processed: {_jobs_processed}")
+
+    except Exception as e:
+        logger.error(f"Error in thread processing: {e}")
+
+def sqs_poller_loop():
+    global _INSTANCE_INDEX, _IS_SURGE_WORKER
+
+    if not wait_for_vllm():
+        logger.error("❌ vLLM not ready — worker exiting")
+        terminate_self()
+        return
+
+    _INSTANCE_INDEX = _get_instance_launch_index()
+    _IS_SURGE_WORKER = _INSTANCE_INDEX >= WARM_POOL_SIZE
+
+    logger.info(f"🔖 Worker type: {'SURGE (self-terminates after 1 job)' if _IS_SURGE_WORKER else 'WARM (runs forever)'} (index={_INSTANCE_INDEX}, WARM_POOL_SIZE={WARM_POOL_SIZE})")
+    logger.info(f"📡 SQS Poller started (CONCURRENCY={MAX_CONCURRENT_JOBS}, DYNAMIC BACKOFF ENABLED). Queue: {SQS_QUEUE_URL}")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
+    active_futures = set()
+    last_activity = time.time()
+    job_processed = False
+    SURGE_IDLE_TIMEOUT_SECONDS = 10 * 60
+
+    while not _shutdown_flag.is_set():
+        if _IS_SURGE_WORKER and job_processed:
+            logger.info(f"✅ Surge worker finished 1 job. Scheduling termination in {TERMINATE_AFTER_COMPLETION_SECONDS}s.")
+            _schedule_termination(TERMINATE_AFTER_COMPLETION_SECONDS)
+            return
+
+        if _IS_SURGE_WORKER and not job_processed:
+            idle_seconds = time.time() - last_activity
+            if idle_seconds > SURGE_IDLE_TIMEOUT_SECONDS:
+                logger.warning(f"💤 Surge worker idle {idle_seconds/60:.1f}m with no job — terminating.")
+                terminate_self()
+                return
+
+        try:
+            active_futures = {f for f in active_futures if not f.done()}
+            active_count = len(active_futures)
+            
+            if active_count > 0:
+                backoff_seconds = active_count * 0.5
+                logger.debug(f"Worker has {active_count} active jobs, backing off {backoff_seconds}s")
+                time.sleep(backoff_seconds)
+                
+            available_slots = MAX_CONCURRENT_JOBS - active_count
+            
+            if available_slots <= 0:
+                time.sleep(1)
+                continue
+
+            response = sqs_client.receive_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MaxNumberOfMessages=1,
+                WaitTimeSeconds=SQS_WAIT_TIME,
+                VisibilityTimeout=SQS_VISIBILITY_TIMEOUT,
+            )
+
+            messages = response.get("Messages", [])
+
+            if not messages:
+                idle_minutes = (time.time() - last_activity) / 60
+                if not _IS_SURGE_WORKER and idle_minutes > 0 and int(idle_minutes) % WARM_IDLE_LOG_MINUTES == 0:
+                    logger.info(f"💤 Warm worker idle {idle_minutes:.1f}m — waiting for next job...")
+                continue
+
+            last_activity = time.time()
+            
+            for msg in messages:
+                future = executor.submit(_process_single_message, msg)
+                active_futures.add(future)
+
+        except Exception as e:
+            logger.exception(f"🚨 Poller error: {e}")
+            time.sleep(5)
+
+def _get_instance_launch_index() -> int:
+    try:
+        resp = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])
+        groups = resp.get("AutoScalingGroups", [])
+        if not groups:
+            return WARM_POOL_SIZE
+        instances = [i for i in groups[0].get("Instances", []) if i.get("LifecycleState") in ("InService", "Pending", "Pending:Wait")]
+        import boto3 as _b3
+        ec2 = _b3.client("ec2", region_name=AWS_REGION)
+        ids = [i["InstanceId"] for i in instances]
+        ec2_resp = ec2.describe_instances(InstanceIds=ids)
+        launch_times = {}
+        for r in ec2_resp["Reservations"]:
+            for inst in r["Instances"]:
+                launch_times[inst["InstanceId"]] = inst.get("LaunchTime")
+        instances_sorted = sorted(instances, key=lambda i: launch_times.get(i["InstanceId"], datetime.min))
+        for idx, inst in enumerate(instances_sorted):
+            if inst["InstanceId"] == INSTANCE_ID:
+                logger.info(f"🎯 Instance index: {idx} / {len(instances_sorted)-1} (warm_pool_size={WARM_POOL_SIZE})")
+                return idx
+        logger.warning(f"Instance {INSTANCE_ID} not found in ASG instance list — treating as surge")
+        return WARM_POOL_SIZE
+    except Exception as e:
+        logger.warning(f"Could not determine instance index: {e} — treating as surge")
+        return WARM_POOL_SIZE
+
+
+# ============================================================
+# FLASK ENDPOINTS
+# ============================================================
+
+flask_app = Flask(__name__)
+
+@flask_app.route("/health", methods=["GET"])
+def health():
+    with _job_completed_lock:
+        completed_at = _job_completed_at
+
+    time_until_termination = None
+    if _IS_SURGE_WORKER and completed_at > 0:
+        elapsed = time.time() - completed_at
+        remaining = max(0, TERMINATE_AFTER_COMPLETION_SECONDS - elapsed)
+        time_until_termination = round(remaining)
+
+    return jsonify({
+        "status": "alive",
+        "instance_id": INSTANCE_ID,
+        "worker_id": WORKER_ID,
+        "worker_type": "surge" if _IS_SURGE_WORKER else "warm",
+        "instance_index": _INSTANCE_INDEX,
+        "warm_pool_size": WARM_POOL_SIZE,
+        "jobs_processed": _jobs_processed,
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+        "time_until_termination": time_until_termination,
+        "vllm_qwen_url": VLLM_QWEN_URL,
+    }), 200
+
+@flask_app.route("/status/<string:file_uuid>", methods=["GET"])
+def get_status(file_uuid):
+    with _status_lock:
+        state = processing_status.get(file_uuid, {}).copy()
+
+    if not state:
+        result_path = os.path.join(RESULT_BASE_DIR, f"{file_uuid}.json")
+        if os.path.exists(result_path):
+            try:
+                with open(result_path, 'r') as f:
+                    result = json.load(f)
+                return jsonify({"status": "completed", "result": result})
+            except:
+                pass
+        return jsonify({"status": "not_found", "message": "Job not found"}), 404
+
+    elapsed = time.time() - state.get("start_time", time.time())
+    total_est = state.get("total_estimated_time", 300)
+    remaining = max(0, total_est - elapsed)
+    progress = _get_progress_percent(state)
+    stage = _get_processing_stage(state)
+
+    response = {
+        "id": file_uuid,
+        "status": state.get("status", "unknown"),
+        "status_overall": state.get("status_overall", "pending"),
+        "progress_percent": progress,
+        "processing_stage": stage,
+        "time_remaining_seconds": int(remaining),
+        "time_remaining_formatted": format_time_remaining(int(remaining)),
+        "documents": state.get("documents", []),
+        "created_at": state.get("created_at"),
+        "instance_id": state.get("instance_id"),
+        "worker_id": state.get("worker_id"),
+    }
+
+    if state.get("demographics_result"):
+        response["demographics"] = state.get("demographics_result")
+    if state.get("icd_medications"):
+        response["extractions"] = state.get("icd_medications")
+        response["diagnoses"] = state.get("icd_result", [])
+        response["medications"] = state.get("medications_result", [])
+        response["allergies"] = state.get("allergies_result", [])
+    if state.get("poc_result"):
+        response["poc"] = state.get("poc_result")
+
+    if state.get("status_overall") == "failed":
+        response["error"] = state.get("critical_error") or state.get("icd_error") or state.get("demographics_error")
+
+    return jsonify(response)
+
+@flask_app.route("/dq/get_details/", methods=["GET"])
+def get_details():
+    file_uuid = request.args.get("id")
+    if not file_uuid:
+        return jsonify({"error": "Missing id parameter"}), 400
+
+    with _status_lock:
+        if file_uuid in processing_status:
+            state = processing_status[file_uuid]
+            if state.get("status_overall") in ["completed", "completed_with_errors"]:
+                merged = merge_extracted_data(state)
+                transformed = transform_raw_output(merged)
+                return jsonify(transformed)
+
+    result_path = os.path.join(RESULT_BASE_DIR, f"{file_uuid}.json")
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, 'r') as f:
+                result = json.load(f)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": f"Failed to read result: {e}"}), 500
+
+    return jsonify({"status": "processing", "message": "Job still processing"}), 202
+
+@flask_app.route("/queue/status", methods=["GET"])
+def queue_status():
+    with _status_lock:
+        queued = [k for k, v in processing_status.items() if v.get("status_overall") == "pending"]
+        processing = [k for k, v in processing_status.items() if v.get("status_overall") == "processing"]
+        completed = [k for k, v in processing_status.items() if v.get("status_overall") in ["completed", "completed_with_errors"]]
+        failed = [k for k, v in processing_status.items() if v.get("status_overall") == "failed"]
+
+    return jsonify({
+        "total_jobs": len(processing_status),
+        "queued": len(queued),
+        "processing": len(processing),
+        "completed": len(completed),
+        "failed": len(failed),
+        "jobs_processed_by_this_worker": _jobs_processed,
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+    })
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            f"%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] "
+            f"[INSTANCE:{INSTANCE_ID}] [WORKER:{WORKER_ID}] %(message)s"
+        ),
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler()
+        ],
+        force=True
+    )
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info("🚀 vLLM WORKER INITIALIZING (HIGH CONCURRENCY MODE)")
+    logger.info(f"   Instance ID: {INSTANCE_ID}")
+    logger.info(f"   Worker ID:   {WORKER_ID}")
+    logger.info(f"   Log File:    {LOG_FILE}")
+    logger.info(f"   SQS Queue:   {SQS_QUEUE_URL}")
+    logger.info(f"   Warm Pool:   {WARM_POOL_SIZE} always-alive workers")
+    logger.info(f"   Max Concurrent Jobs: {MAX_CONCURRENT_JOBS}")
+    logger.info(f"   Log Path:    {LOG_BASE_DIR}")
+    logger.info(f"   Result Path: {RESULT_BASE_DIR}")
+    logger.info(f"   Extraction doc types: {EXTRACTION_DOC_TYPES_PRIORITY}")
+    logger.info("=" * 60)
+
+    s3_client = boto3.client("s3", region_name=AWS_REGION) if USE_S3 else None
+    sqs_client = boto3.client("sqs", region_name=AWS_REGION)
+    asg_client = boto3.client("autoscaling", region_name=AWS_REGION)
+
+    # Single Qwen client for both endpoints
+    qwen_client = OpenAI(base_url=VLLM_QWEN_URL, api_key="local-vllm")
+    llama_client = qwen_client
+
+    LLM_QWEN_MODEL = os.environ.get("LLM_QWEN_MODEL", "/mnt/models/Qwen2.5-VL-7B-Instruct-AWQ")
+    LLM_LLAMA_MODEL = LLM_QWEN_MODEL
+
+    logger.info("📦 Loading non-LLM models...")
+
+    llmv3_processor, llmv3_model = load_models()
+    risk_models = load_risk_models()
+
+    qwen_model = None
+    qwen_processor = None
+    logger.info("✅ DOUBLE-LOAD FIX APPLIED: Using vLLM endpoint for all LLM calls (saved 5.5GB GPU memory)")
+
+    try:
+        paddle.set_flags({
+            "FLAGS_fraction_of_gpu_memory_to_use": 0.05,
+            "FLAGS_allocator_strategy": "auto_growth",
+        })
+    except Exception:
+        pass
+
+    def _resolve_paddle_dirs():
+        base_det = os.environ.get("PADDLE_OCR_DET_MODEL_DIR", "/mnt/models/paddleocr/det")
+        base_rec = os.environ.get("PADDLE_OCR_REC_MODEL_DIR", "/mnt/models/paddleocr/rec")
+        base_cls = os.environ.get("PADDLE_OCR_CLS_MODEL_DIR", "/mnt/models/paddleocr/cls")
+        det = os.path.join(base_det, "en_PP-OCRv3_det_infer")
+        rec = os.path.join(base_rec, "en_PP-OCRv4_rec_infer")
+        cls = os.path.join(base_cls, "ch_ppocr_mobile_v2.0_cls_infer")
+        if all(os.path.isdir(p) for p in [det, rec, cls]):
+            return det, rec, cls
+        return None, None, None
+
+    _paddle_det, _paddle_rec, _paddle_cls = _resolve_paddle_dirs()
+
+    ocr = PaddleOCR(
+        use_angle_cls=True, lang="en",
+        rec_batch_num=8, cls_batch_num=8, det_batch_num=8,
+        use_gpu=True, use_tensorrt=False, drop_score=0.7,
+        det_model_dir=_paddle_det,
+        rec_model_dir=_paddle_rec,
+        cls_model_dir=_paddle_cls,
+        show_log=False,
+    )
+
+    logger.info("✅ All non-LLM models loaded")
+    logger.info(f"🔗 vLLM Qwen endpoint: {VLLM_QWEN_URL}")
+
+    threading.Thread(target=sqs_poller_loop, daemon=True, name="SQSPoller").start()
+    logger.info(f"✅ SQS Poller thread started (CONCURRENT + DYNAMIC BACKOFF, MAX={MAX_CONCURRENT_JOBS})")
+
+    logger.info("✅ Flask server on 0.0.0.0:5003 with endpoints:")
+    logger.info("   - /health")
+    logger.info("   - /status/<file_uuid>")
+    logger.info("   - /dq/get_details/?id=<file_uuid>")
+    logger.info("   - /queue/status")
+    flask_app.run(host="0.0.0.0", port=5003, debug=False)
